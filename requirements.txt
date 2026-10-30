@@ -2,4 +2,4 @@ fastapi
 uvicorn
 python-multipart
 msoffcrypto-tool
-openpyxl
+python-calamine
