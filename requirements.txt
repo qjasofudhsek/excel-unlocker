@@ -1,4 +1,5 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-python-multipart==0.0.9
-msoffcrypto-tool==5.4.1
+fastapi
+uvicorn
+python-multipart
+msoffcrypto-tool
+openpyxl
