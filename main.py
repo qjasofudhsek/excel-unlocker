@@ -65,3 +65,4 @@ async def decrypt_excel(req: DecryptRequest):
             except Exception:
                 pass
         gc.collect()
+ 
