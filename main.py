@@ -4,7 +4,8 @@ from typing import List, Optional
 import msoffcrypto
 import io
 import openpyxl
-from copy import copy
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import base64
 import gc
 from python_calamine import CalamineWorkbook
@@ -23,7 +24,7 @@ class MergeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Excel Merger Engine Ready (Calamine + OpenPyXL)"}
+    return {"status": "ok", "message": "Excel Merger Engine Ready (Calamine + Safe Builder)"}
 
 def decrypt_stream(file_bytes: bytes, password: str) -> io.BytesIO:
     file_io = io.BytesIO(file_bytes)
@@ -44,8 +45,6 @@ async def get_sheets(req: SheetListRequest):
     try:
         file_bytes = base64.b64decode(req.file_base64)
         decrypted = decrypt_stream(file_bytes, req.password)
-        
-        # Calamine으로 안전하고 빠르게 시트 목록만 조회
         workbook = CalamineWorkbook.from_filelike(decrypted)
         return {"status": "success", "sheets": workbook.sheet_names}
     except Exception as e:
@@ -57,128 +56,146 @@ async def get_sheets(req: SheetListRequest):
 
 @app.post("/merge_with_template")
 async def merge_with_template(req: MergeRequest):
-    template_stream = None
-    wb_master = None
     try:
         if not req.files_base64:
             return {"status": "error", "message": "병합할 파일이 없습니다."}
 
-        # 1. Calamine으로 모든 파일에서 '순수 데이터'만 안전하게 추출 (조건부 서식/스타일 오류 원천 방지)
         all_data_rows = []
+        master_title_rows = []
+        master_headers = []
         target_sheet_name = req.sheet_name
 
-        for b64, dept in zip(req.files_base64, req.dept_names):
+        # 1. 모든 파일을 calamine으로 파싱하여 XML 손상 원천 차단
+        for idx, (b64, dept) in enumerate(zip(req.files_base64, req.dept_names)):
             f_bytes = base64.b64decode(b64)
             dec_stream = decrypt_stream(f_bytes, req.password)
             
             cal_wb = CalamineWorkbook.from_filelike(dec_stream)
-            s_name = target_sheet_name if target_sheet_name in cal_wb.sheet_names else cal_wb.sheet_names[0]
+            s_name = target_sheet_name if (target_sheet_name and target_sheet_name in cal_wb.sheet_names) else cal_wb.sheet_names[0]
             sheet = cal_wb.get_sheet_by_name(s_name)
             rows = sheet.to_python()
 
-            # 헤더 행 탐색
+            # 헤더 위치 탐색 ("번호", "부서", "재적" 등)
             header_idx = -1
             for r_idx, row in enumerate(rows):
                 str_row = [str(c or "").strip() for c in row]
-                if any(h in str_row for h in ["번호", "부서", "성명", "구분", "순번"]):
+                if any(h in str_row for h in ["번호", "부서", "성명", "구분", "순번", "재적"]):
                     header_idx = r_idx
                     break
             
             if header_idx == -1:
                 header_idx = 0
 
-            # 실제 유효 데이터만 필터링 (합계/요약 행 만나면 즉시 중단)
+            # 첫 번째 파일에서 상단 제목/설명 및 헤더 보존
+            if idx == 0:
+                for r in range(header_idx):
+                    master_title_rows.append(rows[r])
+                master_headers = rows[header_idx]
+
+            # 실제 순수 데이터 추출 (하단 "계", "합계" 만나면 중단)
             for row in rows[header_idx + 1:]:
                 str_row = [str(c or "").strip() for c in row]
                 if any(f in str_row[:3] for f in ["계", "합계", "총계", "소계"]):
                     break
+                # 빈 줄 제외
                 if not any(v != "" for v in str_row):
                     continue
                 all_data_rows.append(row)
 
             dec_stream.close()
 
-        # 2. 첫 번째 파일을 템플릿(Base)으로 로드하여 서식/스타일 복제
-        first_bytes = base64.b64decode(req.files_base64[0])
-        template_stream = decrypt_stream(first_bytes, req.password)
-        wb_master = openpyxl.load_workbook(template_stream)
+        if not master_headers or len(all_data_rows) == 0:
+            return {"status": "error", "message": "유효한 데이터 행을 추출하지 못했습니다."}
 
-        t_sheet = target_sheet_name if (target_sheet_name and target_sheet_name in wb_master.sheetnames) else wb_master.sheetnames[0]
-        ws_master = wb_master[t_sheet]
+        # 2. openpyxl로 완전히 깨끗한 새 워크북 생성 (XML 깨짐 방지)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = target_sheet_name if target_sheet_name else "수합결과"
 
-        # 템플릿 내 헤더 및 '계' 위치 확인
-        header_row_idx = None
-        footer_row_idx = None
+        # 스타일 정의
+        font_header = Font(name="맑은 고딕", size=10, bold=True)
+        font_data = Font(name="맑은 고딕", size=10)
+        font_total = Font(name="맑은 고딕", size=10, bold=True)
+        fill_header = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        fill_total = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
+        
+        thin = Side(border_style="thin", color="D3D3D3")
+        box_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        double_bottom = Border(left=thin, right=thin, top=thin, bottom=Side(border_style="double", color="000000"))
 
-        for r in range(1, ws_master.max_row + 1):
-            row_vals = [str(ws_master.cell(row=r, column=c).value or "").strip() for c in range(1, ws_master.max_column + 1)]
-            if not header_row_idx and any(h in row_vals for h in ["번호", "부서", "성명", "구분", "순번"]):
-                header_row_idx = r
-                continue
-            if header_row_idx and any(f in row_vals[:3] for f in ["계", "합계", "총계", "소계"]):
-                footer_row_idx = r
-                break
+        current_row = 1
 
-        if not header_row_idx:
-            header_row_idx = 1
-        if not footer_row_idx:
-            footer_row_idx = ws_master.max_row + 1
-
-        # 템플릿의 기존 데이터 서식(글꼴, 테두리, 배경색) 샘플 추출
-        style_sample_row = header_row_idx + 1
-        cell_styles = []
-        for c in range(1, ws_master.max_column + 1):
-            cell = ws_master.cell(row=style_sample_row, column=c)
-            cell_styles.append({
-                "font": copy(cell.font),
-                "border": copy(cell.border),
-                "fill": copy(cell.fill),
-                "alignment": copy(cell.alignment),
-                "number_format": cell.number_format
-            })
-
-        # 기존 템플릿의 샘플 데이터 영역 삭제
-        existing_count = max(0, footer_row_idx - (header_row_idx + 1))
-        if existing_count > 0:
-            ws_master.delete_rows(header_row_idx + 1, amount=existing_count)
-
-        # 3. Calamine으로 수합한 순수 데이터를 서식 입혀서 삽입
-        current_row = header_row_idx + 1
-        for idx, row_data in enumerate(all_data_rows, start=1):
-            ws_master.insert_rows(current_row)
-            for c_idx, val in enumerate(row_data, start=1):
-                cell = ws_master.cell(row=current_row, column=c_idx)
-                # 1번째 열이 번호일 경우 순번 자동 번호 부여
-                if c_idx == 1 and (isinstance(val, (int, float)) or str(val).isdigit()):
-                    cell.value = idx
-                else:
-                    cell.value = val
-
-                # 서식 적용
-                if c_idx - 1 < len(cell_styles):
-                    st = cell_styles[c_idx - 1]
-                    cell.font = copy(st["font"])
-                    cell.border = copy(st["border"])
-                    cell.fill = copy(st["fill"])
-                    cell.alignment = copy(st["alignment"])
-                    cell.number_format = st["number_format"]
-
+        # 상단 제목/설명 행 작성
+        for t_row in master_title_rows:
+            for c_idx, val in enumerate(t_row, start=1):
+                if val is not None and str(val).strip() != "":
+                    ws.cell(row=current_row, column=c_idx, value=val)
             current_row += 1
 
-        # 4. 하단 SUM 수식 범위 자동 업데이트
-        new_footer_row = current_row
-        start_row = header_row_idx + 1
-        end_row = new_footer_row - 1
+        # 헤더 작성
+        header_row_num = current_row
+        col_count = len(master_headers)
+        for c_idx, val in enumerate(master_headers, start=1):
+            cell = ws.cell(row=current_row, column=c_idx, value=val)
+            cell.font = font_header
+            cell.fill = fill_header
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = box_border
+        current_row += 1
 
-        for c in range(1, ws_master.max_column + 1):
-            f_cell = ws_master.cell(row=new_footer_row, column=c)
-            if f_cell.value and isinstance(f_cell.value, str) and f_cell.value.startswith("="):
-                col_letter = openpyxl.utils.get_column_letter(c)
-                f_cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{end_row})"
+        # 순수 데이터 행 작성
+        data_start_row = current_row
+        for num_idx, row in enumerate(all_data_rows, start=1):
+            for c_idx in range(1, col_count + 1):
+                cell = ws.cell(row=current_row, column=c_idx)
+                val = row[c_idx - 1] if c_idx - 1 < len(row) else ""
 
+                # 1열 번호 자동 재정렬
+                if c_idx == 1 and (isinstance(val, (int, float)) or str(val).isdigit()):
+                    cell.value = num_idx
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.value = val
+                    if isinstance(val, (int, float)):
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
+                    else:
+                        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                cell.font = font_data
+                cell.border = box_border
+            current_row += 1
+        data_end_row = current_row - 1
+
+        # 하단 '계' 합계행 작성
+        ws.cell(row=current_row, column=1, value="계").alignment = Alignment(horizontal="center", vertical="center")
+        
+        # 합계 수식(SUM) 자동 연결
+        for c_idx in range(1, col_count + 1):
+            cell = ws.cell(row=current_row, column=c_idx)
+            cell.font = font_total
+            cell.fill = fill_total
+            cell.border = double_bottom
+            
+            # 숫자 열 감지 (데이터 영역의 값이 숫자인 경우 SUM 수식 적용)
+            if c_idx > 2:
+                col_letter = get_column_letter(c_idx)
+                # 데이터 첫 행이 숫자인지 확인
+                sample_val = ws.cell(row=data_start_row, column=c_idx).value
+                if isinstance(sample_val, (int, float)) or (isinstance(sample_val, str) and sample_val.replace(",", "").isdigit()):
+                    cell.value = f"=SUM({col_letter}{data_start_row}:{col_letter}{data_end_row})"
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+
+        # 열 너비 자동 조정
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 11)
+
+        # 바이너리 변환
         out_stream = io.BytesIO()
-        wb_master.save(out_stream)
+        wb.save(out_stream)
         out_stream.seek(0)
+        wb.close()
 
         result_b64 = base64.b64encode(out_stream.getvalue()).decode("utf-8")
         return {
@@ -190,8 +207,4 @@ async def merge_with_template(req: MergeRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
     finally:
-        if wb_master:
-            wb_master.close()
-        if template_stream:
-            template_stream.close()
         gc.collect()
