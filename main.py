@@ -1,29 +1,47 @@
-import io
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 import msoffcrypto
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
+import io
+import openpyxl
 
 app = FastAPI()
 
 @app.get("/")
-def check():
-    return {"status": "열쇠공 서버가 정상 작동 중입니다."}
+def read_root():
+    return {"status": "ok", "message": "Excel Unlocker Server is running!"}
 
 @app.post("/decrypt")
-async def decrypt(file: UploadFile = File(...), password: str = Form(...)):
+async def decrypt_excel(
+    file: UploadFile = File(...),
+    password: str = Form("1234")
+):
     try:
         content = await file.read()
-        f_in = io.BytesIO(content)
-        office_file = msoffcrypto.OfficeFile(f_in)
-
-        # 암호가 애초에 안 걸려 있는 파일이면 그대로 반환
-        if not office_file.is_encrypted():
-            return Response(content=content, media_type="application/octet-stream")
+        file_io = io.BytesIO(content)
+        decrypted = io.BytesIO()
 
         # 암호 해제 시도
-        office_file.load_key(password=password)
-        f_out = io.BytesIO()
-        office_file.decrypt(f_out)
-        return Response(content=f_out.getvalue(), media_type="application/octet-stream")
+        try:
+            office_file = msoffcrypto.OfficeFile(file_io)
+            office_file.load_key(password=password)
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+        except Exception:
+            # 암호가 없거나 형식이 일반 파일인 경우 원본 사용
+            file_io.seek(0)
+            decrypted = file_io
+
+        # 엑셀 시트 데이터 읽기
+        wb = openpyxl.load_workbook(decrypted, data_only=True)
+        sheet = wb.active
+        
+        rows_data = []
+        for row in sheet.iter_rows(values_only=True):
+            # 빈 행 무시
+            if any(cell is not None and str(cell).strip() != "" for cell in row):
+                rows_data.append([str(c) if c is not None else "" for c in row])
+
+        return JSONResponse({"status": "success", "rows": rows_data})
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail="비밀번호가 틀렸거나 손상된 파일입니다.")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
