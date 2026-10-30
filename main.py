@@ -2,9 +2,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import msoffcrypto
 import io
-import openpyxl
 import base64
 import gc
+from python_calamine import CalamineWorkbook
 
 app = FastAPI()
 
@@ -19,49 +19,37 @@ def read_root():
 @app.post("/decrypt")
 async def decrypt_excel(req: DecryptRequest):
     decrypted = None
-    wb = None
     try:
         file_bytes = base64.b64decode(req.file_base64)
         file_io = io.BytesIO(file_bytes)
         decrypted = io.BytesIO()
 
-        # 복호화 시도
+        # 1. 엑셀 비밀번호 복호화
         try:
             office_file = msoffcrypto.OfficeFile(file_io)
             office_file.load_key(password=req.password)
             office_file.decrypt(decrypted)
             decrypted.seek(0)
         except Exception:
+            # 암호가 없거나 일반 엑셀인 경우 원본 스트림 사용
             file_io.seek(0)
             decrypted = file_io
 
         del file_bytes
         del file_io
 
-        # 서식/스타일 오류 무시: data_only=True, read_only=False, keep_vba=False
-        # openpyxl 버그 방지를 위해 read_only 모드 대신 일반 모드로 로드하되 스타일 검사 제외
-        try:
-            wb = openpyxl.load_workbook(
-                decrypted, 
-                data_only=True, 
-                read_only=True
-            )
-            sheet = wb.active
-        except Exception:
-            # 조건부 서식 또는 스타일 XML 충돌 시 대체 로드
-            decrypted.seek(0)
-            wb = openpyxl.load_workbook(
-                decrypted, 
-                data_only=True, 
-                read_only=False,
-                keep_links=False
-            )
-            # 조건부 서식으로 인한 충돌 강제 제거
-            sheet = wb.active
-            sheet.conditional_formatting._cf_rules.clear()
+        # 2. calamine 엔진으로 순수 데이터만 추출 (조건부 서식/스타일 오류 원천 차단)
+        workbook = CalamineWorkbook.from_filelike(decrypted)
+        sheet_names = workbook.sheet_names
+        if not sheet_names:
+            return {"status": "error", "message": "엑셀 시트를 찾을 수 없습니다."}
+
+        first_sheet = workbook.get_sheet_by_name(sheet_names[0])
+        rows = first_sheet.to_python()
 
         rows_data = []
-        for row in sheet.iter_rows(values_only=True):
+        for row in rows:
+            # 빈 행 무시
             if any(cell is not None and str(cell).strip() != "" for cell in row):
                 rows_data.append([str(c).strip() if c is not None else "" for c in row])
 
@@ -71,11 +59,6 @@ async def decrypt_excel(req: DecryptRequest):
         return {"status": "error", "message": str(e)}
 
     finally:
-        if wb is not None:
-            try:
-                wb.close()
-            except Exception:
-                pass
         if decrypted is not None:
             try:
                 decrypted.close()
