@@ -9,6 +9,11 @@ from python_calamine import CalamineWorkbook
 
 app = FastAPI()
 
+# 안전 가드레일 상수 설정 (유령 셀 폭탄 원천 방지)
+MAX_SCAN_ROWS = 3000   # 파일당 최대 탐색 행
+MAX_SCAN_COLS = 50     # 파일당 최대 탐색 열
+MAX_EMPTY_GAP = 5      # 연속 빈 줄 허용 한도 (초과 시 즉시 읽기 종료)
+
 class SheetListRequest(BaseModel):
     file_base64: str
     password: Optional[str] = "1234"
@@ -20,7 +25,7 @@ class OneStopMergeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Excel Unlocker Server is running!"}
+    return {"status": "ok", "message": "Excel Unlocker Safe-Engine Ready"}
 
 def decrypt_file_stream(file_bytes: bytes, password: str) -> io.BytesIO:
     file_io = io.BytesIO(file_bytes)
@@ -32,6 +37,7 @@ def decrypt_file_stream(file_bytes: bytes, password: str) -> io.BytesIO:
         decrypted.seek(0)
         return decrypted
     except Exception:
+        # 암호가 없거나 복호화 대상이 아닌 일반 엑셀인 경우
         file_io.seek(0)
         return file_io
 
@@ -62,6 +68,7 @@ async def extract_all_onestop(req: OneStopMergeRequest):
 
     for idx, b64_str in enumerate(req.files_base64):
         decrypted = None
+        file_bytes = None
         try:
             file_bytes = base64.b64decode(b64_str)
             decrypted = decrypt_file_stream(file_bytes, req.password)
@@ -84,14 +91,20 @@ async def extract_all_onestop(req: OneStopMergeRequest):
                 target_sheet = available_sheets[0]
 
             sheet = workbook.get_sheet_by_name(target_sheet)
-            rows = sheet.to_python()
+            raw_rows = sheet.to_python()
 
-            if not rows:
+            if not raw_rows:
                 continue
 
-            # 헤더 행 탐색
+            # 1. 유령 셀(100만 행/열) 차단: 크기 제한 적용
+            sliced_rows = []
+            for r in raw_rows[:MAX_SCAN_ROWS]:
+                sliced_rows.append(r[:MAX_SCAN_COLS])
+            del raw_rows
+
+            # 2. 헤더 행 탐색
             header_idx = -1
-            for r_idx, row in enumerate(rows):
+            for r_idx, row in enumerate(sliced_rows):
                 str_row = [str(c or "").strip() for c in row]
                 if any(h in str_row for h in ["번호", "부서", "성명", "구분", "순번", "재적", "이름"]):
                     header_idx = r_idx
@@ -100,31 +113,43 @@ async def extract_all_onestop(req: OneStopMergeRequest):
             if header_idx == -1:
                 header_idx = 0
 
-            # 첫 번째 정상 파일에서 제목 및 헤더 확보
+            # 3. 첫 번째 정상 파일 기준 제목 및 헤더 확정
             if len(master_headers) == 0:
                 for r in range(header_idx):
-                    master_title_rows.append([str(c) if c is not None else "" for c in rows[r]])
-                master_headers = [str(c) if c is not None else "" for c in rows[header_idx]]
+                    master_title_rows.append([str(c) if c is not None else "" for c in sliced_rows[r]])
+                master_headers = [str(c) if c is not None else "" for c in sliced_rows[header_idx]]
 
-            # 순수 데이터 행 추출 (계, 합계, 총계, 소계 행 만나면 중단)
-            for row in rows[header_idx + 1:]:
+            # 4. 순수 데이터 추출 (합계 행 또는 연속 빈 행 감지 시 즉시 탈출)
+            empty_streak = 0
+            for row in sliced_rows[header_idx + 1:]:
                 str_row = [str(c or "").strip() for c in row]
+
+                # 하단 요약/합계 행 감지 시 중단
                 if any(f in str_row[:3] for f in ["계", "합계", "총계", "소계"]):
                     break
+
+                # 빈 줄 체크
                 if not any(v != "" for v in str_row):
+                    empty_streak += 1
+                    if empty_streak >= MAX_EMPTY_GAP:
+                        # 빈 줄이 5개 연속 나오면 데이터 끝으로 판정하고 조기 탈출
+                        break
                     continue
+                else:
+                    empty_streak = 0
+
                 all_data_rows.append([str(c) if c is not None else "" for c in row])
 
         except Exception as e:
             error_list.append(f"파일#{idx+1}: {str(e)}")
         finally:
-            # 파일 하나 끝날 때마다 메모리 강제 소각 (502 에러 원천 차단)
             if decrypted:
                 try:
                     decrypted.close()
                 except Exception:
                     pass
-            del file_bytes
+            if file_bytes:
+                del file_bytes
             gc.collect()
 
     return {
