@@ -9,12 +9,20 @@ from python_calamine import CalamineWorkbook
 
 app = FastAPI()
 
-MAX_SCAN_ROWS = 3000   # 최대 탐색 행
-MAX_SCAN_COLS = 40     # 최대 탐색 열
-MAX_EMPTY_GAP = 3      # 연속 빈 줄 허용 한도
+MAX_SCAN_ROWS = 3000   # 파일당 최대 탐색 행
+MAX_SCAN_COLS = 50     # 파일당 최대 탐색 열
+MAX_EMPTY_GAP = 5      # 연속 빈 줄 허용 한도
 
-# 양식 종료 감지 키워드 ('종합' 최우선 반영)
-FOOTER_KEYWORDS = ["종합", "계", "합계", "총계", "소계"]
+# 1. 헤더 판별 후보 키워드 (고유번호, 지파, 회 반영)
+HEADER_CANDIDATES = [
+    "번호", "순번", "고유번호", "지파", "회", 
+    "성명", "이름", "부서", "부서명", "소속", 
+    "교회", "교회명", "지역", "구분", "직책", "직급", "직분", 
+    "시험", "단계", "시험단계", "구역", "연락처", "전화번호", "생년월일", "나이"
+]
+
+# 2. 양식 종료 감지 키워드 (오직 단독/완전 일치로만 검증)
+FOOTER_EXACT_KEYWORDS = ["종합", "계", "합계", "총계", "소계", "총합계"]
 
 class SheetListRequest(BaseModel):
     file_base64: str
@@ -30,7 +38,7 @@ def log(msg: str):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Excel Stream Engine Ready"}
+    return {"status": "ok", "message": "Excel Smart Universal Engine Ready"}
 
 def decrypt_file_stream(file_bytes: bytes, password: str, idx: int = 0) -> io.BytesIO:
     file_io = io.BytesIO(file_bytes)
@@ -42,7 +50,7 @@ def decrypt_file_stream(file_bytes: bytes, password: str, idx: int = 0) -> io.By
         decrypted.seek(0)
         return decrypted
     except Exception as e:
-        log(f"파일#{idx+1} 일반 파일 처리: {str(e)}")
+        log(f"파일#{idx+1} 일반 파일(비암호화) 처리: {str(e)}")
         file_io.seek(0)
         return file_io
 
@@ -66,7 +74,7 @@ async def get_sheets(req: SheetListRequest):
 
 @app.post("/extract_all_onestop")
 async def extract_all_onestop(req: OneStopMergeRequest):
-    log(f"--> 수합 요청 시작 (파일 {len(req.files_base64)}개, 시트: {req.sheet_name})")
+    log(f"--> [범용 엔진] 수합 요청 시작 (파일 {len(req.files_base64)}개, 시트: {req.sheet_name})")
     master_title_rows = []
     master_headers = []
     all_data_rows = []
@@ -75,13 +83,14 @@ async def extract_all_onestop(req: OneStopMergeRequest):
     for idx, b64_str in enumerate(req.files_base64):
         decrypted = None
         file_bytes = None
+        cal_wb = None
         try:
-            log(f"--- 파일#{idx+1} 복호화 및 로드 시작 ---")
+            log(f"--- 파일#{idx+1} 처리 시작 ---")
             file_bytes = base64.b64decode(b64_str)
             decrypted = decrypt_file_stream(file_bytes, req.password, idx)
-            workbook = CalamineWorkbook.from_filelike(decrypted)
+            cal_wb = CalamineWorkbook.from_filelike(decrypted)
 
-            available_sheets = workbook.sheet_names
+            available_sheets = cal_wb.sheet_names
             if not available_sheets:
                 error_list.append(f"파일#{idx+1}: 시트 없음")
                 continue
@@ -96,74 +105,90 @@ async def extract_all_onestop(req: OneStopMergeRequest):
             if not target_sheet:
                 target_sheet = available_sheets[0]
 
-            sheet = workbook.get_sheet_by_name(target_sheet)
+            sheet = cal_wb.get_sheet_by_name(target_sheet)
 
-            # 스트리밍 방식: 시트 데이터에서 필요한 앞부분만 안전하게 가져오기
-            # Calamine 시트 행 탐색
-            log(f"파일#{idx+1} '{target_sheet}' 스트리밍 행 파싱 중...")
-            
-            # to_python() 메모리 폭발 방지: calamine의 iter_rows 활용 또는 안전 순회
+            # 안전 순회 행 데이터 확보
+            raw_rows = []
             if hasattr(sheet, "iter_rows"):
-                row_iterator = sheet.iter_rows()
+                for r_i, r in enumerate(sheet.iter_rows()):
+                    if r_i >= MAX_SCAN_ROWS:
+                        break
+                    raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
             else:
-                row_iterator = sheet.to_python()
+                for r in sheet.to_python()[:MAX_SCAN_ROWS]:
+                    raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
 
-            header_idx = -1
-            collected_rows = []
+            if not raw_rows:
+                log(f"파일#{idx+1} 경고: 데이터 행이 없음")
+                continue
+
+            # 1. 스마트 동적 헤더 탐색 (키워드 매칭 점수제)
+            best_header_idx = -1
+            best_score = 0
+
+            scan_limit = min(30, len(raw_rows))
+            for r_idx in range(scan_limit):
+                row = raw_rows[r_idx]
+                score = 0
+                for cell in row:
+                    if cell and any(k in cell for k in HEADER_CANDIDATES):
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    best_header_idx = r_idx
+
+            if best_header_idx == -1 or best_score < 2:
+                best_header_idx = 0
+
+            log(f"파일#{idx+1} 진짜 헤더 발견: {best_header_idx + 1}행 (매칭 키워드 {best_score}개)")
+
+            # 첫 번째 기준 파일에서 상단 제목/설명 및 헤더 보존
+            if len(master_headers) == 0:
+                for r in range(best_header_idx):
+                    master_title_rows.append(raw_rows[r])
+                master_headers = raw_rows[best_header_idx]
+
+            # 2. 순수 데이터 추출
             empty_streak = 0
+            file_extracted_count = 0
 
-            for r_idx, row in enumerate(row_iterator):
-                if r_idx >= MAX_SCAN_ROWS:
-                    log(f"파일#{idx+1} 최대 행 한도({MAX_SCAN_ROWS}) 도달로 조기 종료")
+            for r_idx in range(best_header_idx + 1, len(raw_rows)):
+                row = raw_rows[r_idx]
+
+                # (1) 요약행 완전일치 검사 ('계', '종합', '합계' 등)
+                is_footer = False
+                for cell_val in row[:3]:
+                    clean_val = cell_val.replace(" ", "")
+                    if clean_val in FOOTER_EXACT_KEYWORDS:
+                        is_footer = True
+                        break
+
+                if is_footer:
+                    log(f"파일#{idx+1} [정상 종료]: {r_idx + 1}행에서 요약행('{clean_val}') 감지하여 중단")
                     break
 
-                # 40열 초과 유령 셀 잘라내기
-                clean_row = [str(c or "").strip() for c in list(row)[:MAX_SCAN_COLS]]
-
-                # 헤더 탐색
-                if header_idx == -1:
-                    collected_rows.append(clean_row)
-                    if any(h in clean_row for h in ["번호", "부서", "성명", "구분", "순번", "재적", "이름"]):
-                        header_idx = r_idx
-                    continue
-
-                # --- 헤더 이후 실제 데이터 영역 검사 ---
-                
-                # 1. 종료 키워드 감지 ('종합', '계', '합계' 등)
-                first_few_cells = "".join(clean_row[:3]).replace(" ", "")
-                if any(k in first_few_cells for k in FOOTER_KEYWORDS):
-                    log(f"파일#{idx+1} [종료 키워드 감지]: '{first_few_cells}' 발견으로 {r_idx+1}행에서 즉시 종료")
-                    break
-
-                # 2. 빈 행 연속 감지
-                if not any(v != "" for v in clean_row):
+                # (2) 행 전체 공백 검사
+                non_empty_cells = [c for c in row if c != ""]
+                if len(non_empty_cells) == 0:
                     empty_streak += 1
                     if empty_streak >= MAX_EMPTY_GAP:
-                        log(f"파일#{idx+1} 빈 줄 {MAX_EMPTY_GAP}개 연속 감지 -> 데이터 종료 판단")
+                        log(f"파일#{idx+1} [정상 종료]: 빈 줄 {MAX_EMPTY_GAP}개 연속 감지 -> 데이터 종료")
                         break
                     continue
                 else:
                     empty_streak = 0
 
-                all_data_rows.append(clean_row)
+                all_data_rows.append(row)
+                file_extracted_count += 1
 
-            # 헤더를 못 찾은 경우 기본값
-            if header_idx == -1:
-                header_idx = 0
-
-            # 첫 번째 정상 파일 기준 제목 및 헤더 확정
-            if len(master_headers) == 0 and len(collected_rows) > 0:
-                for r in range(min(header_idx, len(collected_rows))):
-                    master_title_rows.append(collected_rows[r])
-                if header_idx < len(collected_rows):
-                    master_headers = collected_rows[header_idx]
-
-            log(f"파일#{idx+1} 추출 완료 (현재 총 누적 데이터: {len(all_data_rows)}행)")
+            log(f"파일#{idx+1} 추출 완료 (해당 파일: {file_extracted_count}행, 누적: {len(all_data_rows)}행)")
 
         except Exception as e:
-            log(f"파일#{idx+1} 에러: {str(e)}")
+            log(f"파일#{idx+1} 처리 실패: {str(e)}")
             error_list.append(f"파일#{idx+1}: {str(e)}")
         finally:
+            if cal_wb:
+                del cal_wb
             if decrypted:
                 try:
                     decrypted.close()
@@ -173,7 +198,7 @@ async def extract_all_onestop(req: OneStopMergeRequest):
                 del file_bytes
             gc.collect()
 
-    log(f"--> 최종 완료: 총 {len(all_data_rows)}행 데이터 병합 성공")
+    log(f"--> [범용 엔진] 전체 완료: 총 {len(all_data_rows)}행 수합됨, 에러 {len(error_list)}건")
     return {
         "status": "success",
         "title_rows": master_title_rows,
