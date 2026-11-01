@@ -11,12 +11,12 @@ app = FastAPI()
 
 class SheetListRequest(BaseModel):
     file_base64: str
-    password: str = "1234"
+    password: Optional[str] = "1234"
 
 class ExtractRequest(BaseModel):
     file_base64: str
     sheet_name: Optional[str] = None
-    password: str = "1234"
+    password: Optional[str] = "1234"
 
 @app.get("/")
 def read_root():
@@ -27,11 +27,12 @@ def decrypt_stream(file_bytes: bytes, password: str) -> io.BytesIO:
     decrypted = io.BytesIO()
     try:
         office_file = msoffcrypto.OfficeFile(file_io)
-        office_file.load_key(password=password)
+        office_file.load_key(password=password or "1234")
         office_file.decrypt(decrypted)
         decrypted.seek(0)
         return decrypted
     except Exception:
+        # 암호가 없거나 일반 엑셀인 경우
         file_io.seek(0)
         return file_io
 
@@ -47,7 +48,10 @@ async def get_sheets(req: SheetListRequest):
         return {"status": "error", "message": str(e)}
     finally:
         if decrypted:
-            decrypted.close()
+            try:
+                decrypted.close()
+            except Exception:
+                pass
         gc.collect()
 
 @app.post("/extract_data")
@@ -58,11 +62,29 @@ async def extract_data(req: ExtractRequest):
         decrypted = decrypt_stream(file_bytes, req.password)
         workbook = CalamineWorkbook.from_filelike(decrypted)
 
-        target = req.sheet_name if (req.sheet_name and req.sheet_name in workbook.sheet_names) else workbook.sheet_names[0]
+        available_sheets = workbook.sheet_names
+        if not available_sheets:
+            return {"status": "error", "message": "워크시트가 존재하지 않습니다."}
+
+        # 시트명 매칭 (공백 무시 및 유연한 탐색)
+        target = None
+        if req.sheet_name:
+            req_clean = req.sheet_name.strip()
+            for s in available_sheets:
+                if s.strip() == req_clean:
+                    target = s
+                    break
+        
+        if not target:
+            target = available_sheets[0]
+
         sheet = workbook.get_sheet_by_name(target)
         rows = sheet.to_python()
 
-        # 헤더 행 탐색 ("번호", "부서", "재적" 등)
+        if not rows:
+            return {"status": "success", "title_rows": [], "headers": [], "data_rows": []}
+
+        # 헤더 행 탐색
         header_idx = -1
         for r_idx, row in enumerate(rows):
             str_row = [str(c or "").strip() for c in row]
@@ -73,14 +95,14 @@ async def extract_data(req: ExtractRequest):
         if header_idx == -1:
             header_idx = 0
 
-        # 상단 설명/제목 행 분리
+        # 상단 설명/제목 분리
         title_rows = []
         for r in range(header_idx):
             title_rows.append([str(c) if c is not None else "" for c in rows[r]])
 
         headers = [str(c) if c is not None else "" for c in rows[header_idx]]
 
-        # 순수 데이터 행 추출 (하단 "계", "합계" 만나면 즉시 중단)
+        # 순수 데이터 행 분리 (합계/계 행 만나면 중단)
         data_rows = []
         for row in rows[header_idx + 1:]:
             str_row = [str(c or "").strip() for c in row]
@@ -101,5 +123,8 @@ async def extract_data(req: ExtractRequest):
         return {"status": "error", "message": str(e)}
     finally:
         if decrypted:
-            decrypted.close()
+            try:
+                decrypted.close()
+            except Exception:
+                pass
         gc.collect()
