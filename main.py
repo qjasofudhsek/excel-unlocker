@@ -89,7 +89,6 @@ async def get_sheets(req: SheetListRequest):
             except Exception: pass
         gc.collect()
 
-# [기존 롤백] 주요 항목 검증 (고유번호, 이름/부서 누락, 성별, 나이, 연락처, 수식에러)
 @app.post("/validate_file")
 async def validate_file(req: ValidateRequest):
     decrypted = None
@@ -203,7 +202,6 @@ async def validate_file(req: ValidateRequest):
                         if not val:
                             errors_summary.append(f"{cell_pos}: 고유번호 누락")
                         elif not ID_PATTERN.match(val):
-                            # 요청 반영: '고유번호 형식 오류'로 변경
                             errors_summary.append(f"{cell_pos}: 고유번호 형식 오류 (8자리-5자리 아님)")
                         else:
                             if val not in seen_ids: seen_ids[val] = []
@@ -362,4 +360,4 @@ async def extract_all_onestop(req: MergeRequest):
         "is_multi_sheet": is_merge_all,
         "sheets_data": merged_sheets_dict,
         "errors": error_list
-    }ㄴ
+    }
