@@ -2,18 +2,19 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import msoffcrypto
+import openpyxl
 import io
 import base64
 import gc
 import re
-from python_calamine import CalamineWorkbook
 
 app = FastAPI()
 
-MAX_SCAN_ROWS = 3000
-MAX_SCAN_COLS = 50
-MAX_EMPTY_GAP = 5
+MAX_SCAN_ROWS = 1000   # 파일당 최대 탐색 행
+MAX_SCAN_COLS = 40     # 최대 탐색 열
+MAX_EMPTY_GAP = 5      # 연속 빈 줄 허용 한도
 
+# 1. 헤더 판별 후보 키워드 (고유번호, 지파, 회 포함)
 HEADER_CANDIDATES = [
     "번호", "순번", "고유번호", "지파", "회", 
     "성명", "이름", "부서", "부서명", "소속", 
@@ -21,8 +22,10 @@ HEADER_CANDIDATES = [
     "시험", "단계", "시험단계", "구역", "연락처", "전화번호", "핸드폰번호", "생년월일", "나이"
 ]
 
+# 2. 양식 종료 감지 키워드 (오직 단독/완전 일치로만 검증)
 FOOTER_EXACT_KEYWORDS = ["종합", "계", "합계", "총계", "소계", "총합계"]
 
+# 3. 정규식 패턴 (고유번호, 연락처, 엑셀 수식 에러)
 ID_PATTERN = re.compile(r"^\d{8}-\d{5}$")
 PHONE_PATTERN = re.compile(r"^01[016789]-?\d{3,4}-?\d{4}$")
 EXCEL_ERROR_PATTERN = re.compile(r"^#(VALUE!|REF!|DIV/0!|N/A|NAME\?|NUM!|NULL!)$")
@@ -45,7 +48,7 @@ def log(msg: str):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Smart Filter Engine Ready"}
+    return {"status": "ok", "message": "Ultra-Low Memory Streaming Engine Ready"}
 
 def get_col_letter(col_idx: int) -> str:
     dividend = col_idx + 1
@@ -72,14 +75,18 @@ def decrypt_file_stream(file_bytes: bytes, password: str, idx: int = 0) -> io.By
 @app.post("/get_sheets")
 async def get_sheets(req: SheetListRequest):
     decrypted = None
+    wb = None
     try:
         file_bytes = base64.b64decode(req.file_base64)
         decrypted = decrypt_file_stream(file_bytes, req.password, 0)
-        workbook = CalamineWorkbook.from_filelike(decrypted)
-        return {"status": "success", "sheets": workbook.sheet_names}
+        wb = openpyxl.load_workbook(decrypted, read_only=True, data_only=True)
+        return {"status": "success", "sheets": wb.sheetnames}
     except Exception as e:
         return {"status": "error", "message": str(e)}
     finally:
+        if wb:
+            try: wb.close()
+            except Exception: pass
         if decrypted:
             try: decrypted.close()
             except Exception: pass
@@ -90,27 +97,27 @@ async def get_sheets(req: SheetListRequest):
 async def validate_file(req: ValidateRequest):
     decrypted = None
     file_bytes = None
-    cal_wb = None
+    wb = None
     try:
         file_bytes = base64.b64decode(req.file_base64)
         decrypted = decrypt_file_stream(file_bytes, req.password, 0)
-        cal_wb = CalamineWorkbook.from_filelike(decrypted)
+        wb = openpyxl.load_workbook(decrypted, read_only=True, data_only=True)
 
-        if not cal_wb.sheet_names:
+        if not wb.sheetnames:
             return {"status": "error", "message": "시트가 존재하지 않습니다."}
 
         errors_summary = []
 
-        for s_name in cal_wb.sheet_names:
-            sheet = cal_wb.get_sheet_by_name(s_name)
+        for s_name in wb.sheetnames:
+            ws = wb[s_name]
             raw_rows = []
-            if hasattr(sheet, "iter_rows"):
-                for r_i, r in enumerate(sheet.iter_rows()):
-                    if r_i >= MAX_SCAN_ROWS: break
-                    raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
-            else:
-                for r in sheet.to_python()[:MAX_SCAN_ROWS]:
-                    raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
+            
+            # 1줄씩 스트리밍 읽기 (104만 유령 셀 메모리 폭발 차단)
+            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx >= MAX_SCAN_ROWS:
+                    break
+                row_str = [str(c or "").strip() for c in list(row)[:MAX_SCAN_COLS]]
+                raw_rows.append(row_str)
 
             if not raw_rows:
                 continue
@@ -168,7 +175,7 @@ async def validate_file(req: ValidateRequest):
                     errors_summary.append(f"[{s_name}] {row_num}행: '예시(ex)' 행 미삭제 제출")
                     continue
 
-                # [방향 1] 실제 유효 데이터 행인지 판별 (이름/부서가 비어있으면 빈 껍데기 수식 행으로 무시)
+                # 실제 유효 데이터 행인지 판별 (이름/부서가 비어있으면 수식 빈 줄로 간주하고 패스)
                 has_real_person = False
                 if name_col != -1 and name_col < len(row):
                     n_val = row[name_col]
@@ -183,11 +190,9 @@ async def validate_file(req: ValidateRequest):
                     if len(non_empty) >= 3:
                         has_real_person = True
 
-                # 이름이나 데이터가 아예 없는 껍데기 줄은 검증 에러로 치지 않고 패스
                 if not has_real_person:
                     continue
 
-                # 실제 데이터 행에 대해서만 상세 무결성 검증
                 for c_idx, val in enumerate(row):
                     cell_pos = f"[{s_name}] {get_col_letter(c_idx)}{row_num}"
 
@@ -233,14 +238,16 @@ async def validate_file(req: ValidateRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
     finally:
-        if cal_wb: del cal_wb
+        if wb:
+            try: wb.close()
+            except Exception: pass
         if decrypted:
             try: decrypted.close()
             except Exception: pass
         if file_bytes: del file_bytes
         gc.collect()
 
-# [방향 1 적용 병합 엔진] 빈 껍데기 수식 행/기본 번호 행 원천 배제
+# [병합 엔진] 단일 시트 및 전체 시트 일괄 병합 지원 + 빈 수식 행 배제
 @app.post("/extract_all_onestop")
 async def extract_all_onestop(req: MergeRequest):
     is_merge_all = (req.sheet_name is None or req.sheet_name.strip() in ["", "ALL", "모든시트", "전체시트"])
@@ -250,13 +257,13 @@ async def extract_all_onestop(req: MergeRequest):
     for idx, b64_str in enumerate(req.files_base64):
         decrypted = None
         file_bytes = None
-        cal_wb = None
+        wb = None
         try:
             file_bytes = base64.b64decode(b64_str)
             decrypted = decrypt_file_stream(file_bytes, req.password, idx)
-            cal_wb = CalamineWorkbook.from_filelike(decrypted)
+            wb = openpyxl.load_workbook(decrypted, read_only=True, data_only=True)
 
-            available_sheets = cal_wb.sheet_names
+            available_sheets = wb.sheetnames
             if not available_sheets:
                 error_list.append(f"파일#{idx+1}: 시트 없음")
                 continue
@@ -267,15 +274,14 @@ async def extract_all_onestop(req: MergeRequest):
                 if s_name not in available_sheets:
                     continue
 
-                sheet = cal_wb.get_sheet_by_name(s_name)
+                ws = wb[s_name]
                 raw_rows = []
-                if hasattr(sheet, "iter_rows"):
-                    for r_i, r in enumerate(sheet.iter_rows()):
-                        if r_i >= MAX_SCAN_ROWS: break
-                        raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
-                else:
-                    for r in sheet.to_python()[:MAX_SCAN_ROWS]:
-                        raw_rows.append([str(c or "").strip() for c in list(r)[:MAX_SCAN_COLS]])
+                
+                # 초경량 스트리밍 순회
+                for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                    if r_idx >= MAX_SCAN_ROWS:
+                        break
+                    raw_rows.append([str(c or "").strip() for c in list(row)[:MAX_SCAN_COLS]])
 
                 if not raw_rows:
                     continue
@@ -294,7 +300,6 @@ async def extract_all_onestop(req: MergeRequest):
 
                 header_row = raw_rows[best_header_idx]
 
-                # 핵심 열(이름 / 부서) 위치 파악
                 name_col = -1
                 dept_col = -1
                 for c_idx, h in enumerate(header_row):
@@ -325,44 +330,11 @@ async def extract_all_onestop(req: MergeRequest):
                     else:
                         empty_streak = 0
 
-                    # 예시 행 제외
                     if any(row[c].startswith("ex") or "예시" in row[c] for c in range(min(3, len(row)))):
                         continue
 
-                    # [방향 1 핵심 로직] 알맹이(이름/부서) 없는 수식 행 필터링
+                    # 이름/부서가 없는 껍데기 수식 행은 배제
                     has_real_person = False
                     if name_col != -1 and name_col < len(row):
                         n_val = row[name_col]
-                        if n_val and n_val != "None" and not n_val.startswith("#"):
-                            has_real_person = True
-                    elif dept_col != -1 and dept_col < len(row):
-                        d_val = row[dept_col]
-                        if d_val and d_val != "None" and not d_val.startswith("#"):
-                            has_real_person = True
-                    else:
-                        non_empty = [c for c in row if c and c != "None"]
-                        if len(non_empty) >= 3:
-                            has_real_person = True
-
-                    # 이름이나 부서가 없는 껍데기 수식 행은 수합 목록에 절대 넣지 않음
-                    if not has_real_person:
-                        continue
-
-                    merged_sheets_dict[s_name]["data_rows"].append(row)
-
-        except Exception as e:
-            error_list.append(f"파일#{idx+1}: {str(e)}")
-        finally:
-            if cal_wb: del cal_wb
-            if decrypted:
-                try: decrypted.close()
-                except Exception: pass
-            if file_bytes: del file_bytes
-            gc.collect()
-
-    return {
-        "status": "success",
-        "is_multi_sheet": is_merge_all,
-        "sheets_data": merged_sheets_dict,
-        "errors": error_list
-    }
+                        if n_val and n
