@@ -23,8 +23,6 @@ HEADER_CANDIDATES = [
 
 FOOTER_EXACT_KEYWORDS = ["종합", "계", "합계", "총계", "소계", "총합계"]
 
-OPTIONAL_COLUMNS = ["환우석여부", "비고", "사유", "불참사유", "사명경험", "참석", "등록상태"]
-
 ID_PATTERN = re.compile(r"^\d{8}-\d{5}$")
 PHONE_PATTERN = re.compile(r"^01[016789]-?\d{3,4}-?\d{4}$")
 EXCEL_ERROR_PATTERN = re.compile(r"^#(VALUE!|REF!|DIV/0!|N/A|NAME\?|NUM!|NULL!)$")
@@ -47,7 +45,7 @@ def log(msg: str):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Universal Blank & Integrity Inspector Ready"}
+    return {"status": "ok", "message": "Standard Integrity Inspector Ready"}
 
 def get_col_letter(col_idx: int) -> str:
     dividend = col_idx + 1
@@ -91,6 +89,7 @@ async def get_sheets(req: SheetListRequest):
             except Exception: pass
         gc.collect()
 
+# [기존 롤백] 주요 항목 검증 (고유번호, 이름/부서 누락, 성별, 나이, 연락처, 수식에러)
 @app.post("/validate_file")
 async def validate_file(req: ValidateRequest):
     decrypted = None
@@ -132,19 +131,21 @@ async def validate_file(req: ValidateRequest):
                 continue
 
             header_row = raw_rows[best_header_idx]
-            
-            valid_cols = {}
+            col_map = {}
             name_col = -1
             dept_col = -1
 
             for c_idx, h in enumerate(header_row):
                 h_clean = h.replace("\n", "").replace(" ", "")
-                if not h_clean:
-                    continue
-                valid_cols[c_idx] = h_clean
-                if any(n in h_clean for n in ["성명", "이름"]):
+                if "고유번호" in h_clean: col_map[c_idx] = "id"
+                elif any(p in h_clean for p in ["핸드폰", "연락처", "전화번호"]): col_map[c_idx] = "phone"
+                elif h_clean in ["성별"]: col_map[c_idx] = "gender"
+                elif any(a in h_clean for a in ["나이", "만나이"]): col_map[c_idx] = "age"
+                elif any(n in h_clean for n in ["성명", "이름"]): 
+                    col_map[c_idx] = "name"
                     name_col = c_idx
-                elif any(d in h_clean for d in ["부서", "부서명"]):
+                elif any(d in h_clean for d in ["부서", "부서명"]): 
+                    col_map[c_idx] = "dept"
                     dept_col = c_idx
 
             seen_ids = {}
@@ -186,41 +187,38 @@ async def validate_file(req: ValidateRequest):
                 if not has_real_person:
                     continue
 
-                for c_idx, col_title in valid_cols.items():
-                    val = row[c_idx] if c_idx < len(row) else ""
-                    cell_pos = f"[{s_name}] {get_col_letter(c_idx)}{row_num}({col_title})"
+                for c_idx, val in enumerate(row):
+                    cell_pos = f"[{s_name}] {get_col_letter(c_idx)}{row_num}"
 
                     if EXCEL_ERROR_PATTERN.match(val):
-                        errors_summary.append(f"{cell_pos}: 수식 계산 오류({val})")
+                        errors_summary.append(f"{cell_pos}: 엑셀 수식 계산 오류({val})")
                         continue
 
-                    is_optional = any(opt in col_title for opt in OPTIONAL_COLUMNS)
-                    if not val or val == "None":
-                        if not is_optional:
-                            if not any(num_word in col_title for num_word in ["번호", "순번"]):
-                                errors_summary.append(f"{cell_pos}: 항목 누락 (공란)")
-                        continue
+                    col_type = col_map.get(c_idx)
+                    if not col_type: continue
 
-                    if "고유번호" in col_title:
-                        if not ID_PATTERN.match(val):
-                            # 요청 반영: '고유번호 형식 오류'로 수정
+                    if col_type in ["name", "dept"] and not val:
+                        errors_summary.append(f"{cell_pos}: 필수 항목 누락(빈칸)")
+                    elif col_type == "id":
+                        if not val:
+                            errors_summary.append(f"{cell_pos}: 고유번호 누락")
+                        elif not ID_PATTERN.match(val):
+                            # 요청 반영: '고유번호 형식 오류'로 변경
                             errors_summary.append(f"{cell_pos}: 고유번호 형식 오류 (8자리-5자리 아님)")
                         else:
                             if val not in seen_ids: seen_ids[val] = []
                             seen_ids[val].append(cell_pos)
-
-                    elif any(p in col_title for p in ["핸드폰", "연락처", "전화번호"]):
-                        if not PHONE_PATTERN.match(val):
+                    elif col_type == "phone":
+                        if val and not PHONE_PATTERN.match(val):
                             errors_summary.append(f"{cell_pos}: 연락처 번호 형식 오류")
-
-                    elif col_title == "성별":
-                        if val not in ["남", "여"]:
+                    elif col_type == "gender":
+                        if val and val not in ["남", "여"]:
                             errors_summary.append(f"{cell_pos}: 성별 표기 오류 ('남' 또는 '여'만 가능)")
-
-                    elif any(a in col_title for a in ["나이", "만나이"]):
-                        clean_age = val.replace("세", "").strip()
-                        if not clean_age.isdigit() or not (1 <= int(clean_age) <= 130):
-                            errors_summary.append(f"{cell_pos}: 나이 숫자 표기 오류")
+                    elif col_type == "age":
+                        if val:
+                            clean_age = val.replace("세", "").strip()
+                            if not clean_age.isdigit() or not (1 <= int(clean_age) <= 130):
+                                errors_summary.append(f"{cell_pos}: 나이 숫자 표기 오류")
 
             for uid, pos_list in seen_ids.items():
                 if len(pos_list) > 1:
@@ -364,4 +362,4 @@ async def extract_all_onestop(req: MergeRequest):
         "is_multi_sheet": is_merge_all,
         "sheets_data": merged_sheets_dict,
         "errors": error_list
-    }
+    }ㄴ
