@@ -14,7 +14,6 @@ MAX_SCAN_ROWS = 1000   # 파일당 최대 탐색 행
 MAX_SCAN_COLS = 40     # 최대 탐색 열
 MAX_EMPTY_GAP = 5      # 연속 빈 줄 허용 한도
 
-# 1. 헤더 판별 후보 키워드 (고유번호, 지파, 회 포함)
 HEADER_CANDIDATES = [
     "번호", "순번", "고유번호", "지파", "회", 
     "성명", "이름", "부서", "부서명", "소속", 
@@ -22,10 +21,8 @@ HEADER_CANDIDATES = [
     "시험", "단계", "시험단계", "구역", "연락처", "전화번호", "핸드폰번호", "생년월일", "나이"
 ]
 
-# 2. 양식 종료 감지 키워드 (오직 단독/완전 일치로만 검증)
 FOOTER_EXACT_KEYWORDS = ["종합", "계", "합계", "총계", "소계", "총합계"]
 
-# 3. 정규식 패턴 (고유번호, 연락처, 엑셀 수식 에러)
 ID_PATTERN = re.compile(r"^\d{8}-\d{5}$")
 PHONE_PATTERN = re.compile(r"^01[016789]-?\d{3,4}-?\d{4}$")
 EXCEL_ERROR_PATTERN = re.compile(r"^#(VALUE!|REF!|DIV/0!|N/A|NAME\?|NUM!|NULL!)$")
@@ -40,7 +37,7 @@ class ValidateRequest(BaseModel):
 
 class MergeRequest(BaseModel):
     files_base64: List[str]
-    sheet_name: Optional[str] = None  # None 또는 "ALL"이면 전체 시트 일괄 병합
+    sheet_name: Optional[str] = None
     password: Optional[str] = "1234"
 
 def log(msg: str):
@@ -92,7 +89,6 @@ async def get_sheets(req: SheetListRequest):
             except Exception: pass
         gc.collect()
 
-# [전수 검증] 수식 빈 줄은 검증 대상에서 자동 제외하고 실제 유효 데이터만 검사
 @app.post("/validate_file")
 async def validate_file(req: ValidateRequest):
     decrypted = None
@@ -112,7 +108,6 @@ async def validate_file(req: ValidateRequest):
             ws = wb[s_name]
             raw_rows = []
             
-            # 1줄씩 스트리밍 읽기 (104만 유령 셀 메모리 폭발 차단)
             for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
                 if r_idx >= MAX_SCAN_ROWS:
                     break
@@ -170,12 +165,10 @@ async def validate_file(req: ValidateRequest):
 
                 row_num = r_idx + 1
 
-                # 예시 행 필터
                 if any(row[c].startswith("ex") or "예시" in row[c] for c in range(min(3, len(row)))):
                     errors_summary.append(f"[{s_name}] {row_num}행: '예시(ex)' 행 미삭제 제출")
                     continue
 
-                # 실제 유효 데이터 행인지 판별 (이름/부서가 비어있으면 수식 빈 줄로 간주하고 패스)
                 has_real_person = False
                 if name_col != -1 and name_col < len(row):
                     n_val = row[name_col]
@@ -247,7 +240,6 @@ async def validate_file(req: ValidateRequest):
         if file_bytes: del file_bytes
         gc.collect()
 
-# [병합 엔진] 단일 시트 및 전체 시트 일괄 병합 지원 + 빈 수식 행 배제
 @app.post("/extract_all_onestop")
 async def extract_all_onestop(req: MergeRequest):
     is_merge_all = (req.sheet_name is None or req.sheet_name.strip() in ["", "ALL", "모든시트", "전체시트"])
@@ -277,7 +269,6 @@ async def extract_all_onestop(req: MergeRequest):
                 ws = wb[s_name]
                 raw_rows = []
                 
-                # 초경량 스트리밍 순회
                 for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
                     if r_idx >= MAX_SCAN_ROWS:
                         break
@@ -333,8 +324,40 @@ async def extract_all_onestop(req: MergeRequest):
                     if any(row[c].startswith("ex") or "예시" in row[c] for c in range(min(3, len(row)))):
                         continue
 
-                    # 이름/부서가 없는 껍데기 수식 행은 배제
                     has_real_person = False
                     if name_col != -1 and name_col < len(row):
                         n_val = row[name_col]
-                        if n_val and n
+                        if n_val and n_val != "None" and not n_val.startswith("#"):
+                            has_real_person = True
+                    elif dept_col != -1 and dept_col < len(row):
+                        d_val = row[dept_col]
+                        if d_val and d_val != "None" and not d_val.startswith("#"):
+                            has_real_person = True
+                    else:
+                        non_empty = [c for c in row if c and c != "None"]
+                        if len(non_empty) >= 3:
+                            has_real_person = True
+
+                    if not has_real_person:
+                        continue
+
+                    merged_sheets_dict[s_name]["data_rows"].append(row)
+
+        except Exception as e:
+            error_list.append(f"파일#{idx+1}: {str(e)}")
+        finally:
+            if wb:
+                try: wb.close()
+                except Exception: pass
+            if decrypted:
+                try: decrypted.close()
+                except Exception: pass
+            if file_bytes: del file_bytes
+            gc.collect()
+
+    return {
+        "status": "success",
+        "is_multi_sheet": is_merge_all,
+        "sheets_data": merged_sheets_dict,
+        "errors": error_list
+    }
