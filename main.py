@@ -23,7 +23,6 @@ HEADER_CANDIDATES = [
 
 FOOTER_EXACT_KEYWORDS = ["종합", "계", "합계", "총계", "소계", "총합계"]
 
-# 선택 입력(공란이어도 정상으로 인정할 열)
 OPTIONAL_COLUMNS = ["환우석여부", "비고", "사유", "불참사유", "사명경험", "참석", "등록상태"]
 
 ID_PATTERN = re.compile(r"^\d{8}-\d{5}$")
@@ -92,7 +91,6 @@ async def get_sheets(req: SheetListRequest):
             except Exception: pass
         gc.collect()
 
-# [전수 검증] 모든 열의 공란(미작성) 및 형식 오류 정밀 감지
 @app.post("/validate_file")
 async def validate_file(req: ValidateRequest):
     decrypted = None
@@ -135,7 +133,6 @@ async def validate_file(req: ValidateRequest):
 
             header_row = raw_rows[best_header_idx]
             
-            # 유효 헤더 컬럼 목록 구축 (빈 헤더 제외)
             valid_cols = {}
             name_col = -1
             dept_col = -1
@@ -168,12 +165,10 @@ async def validate_file(req: ValidateRequest):
 
                 row_num = r_idx + 1
 
-                # 예시 행 필터
                 if any(row[c].startswith("ex") or "예시" in row[c] for c in range(min(3, len(row)))):
                     errors_summary.append(f"[{s_name}] {row_num}행: '예시(ex)' 행 미삭제 제출")
                     continue
 
-                # 실제 유효 명단 행인지 판정 (이름이나 부서가 있는 줄)
                 has_real_person = False
                 if name_col != -1 and name_col < len(row):
                     n_val = row[name_col]
@@ -191,50 +186,42 @@ async def validate_file(req: ValidateRequest):
                 if not has_real_person:
                     continue
 
-                # 유효 데이터 행에 대해 모든 열 전수 검사 (공란 + 형식오류)
                 for c_idx, col_title in valid_cols.items():
                     val = row[c_idx] if c_idx < len(row) else ""
                     cell_pos = f"[{s_name}] {get_col_letter(c_idx)}{row_num}({col_title})"
 
-                    # 1. 엑셀 수식 에러 검출
                     if EXCEL_ERROR_PATTERN.match(val):
                         errors_summary.append(f"{cell_pos}: 수식 계산 오류({val})")
                         continue
 
-                    # 2. 공란(빈칸) 검사: 선택 입력 열이 아닌데 비어있는 경우
                     is_optional = any(opt in col_title for opt in OPTIONAL_COLUMNS)
                     if not val or val == "None":
                         if not is_optional:
-                            # 번호/순번 열은 자동 부여되므로 공란이어도 통과
                             if not any(num_word in col_title for num_word in ["번호", "순번"]):
                                 errors_summary.append(f"{cell_pos}: 항목 누락 (공란)")
                         continue
 
-                    # 3. 고유번호 형식 검사
                     if "고유번호" in col_title:
                         if not ID_PATTERN.match(val):
-                            errors_summary.append(f"{cell_pos}: 고유번호 규격 오류 (8자리-5자리 아님)")
+                            # 요청 반영: '고유번호 형식 오류'로 수정
+                            errors_summary.append(f"{cell_pos}: 고유번호 형식 오류 (8자리-5자리 아님)")
                         else:
                             if val not in seen_ids: seen_ids[val] = []
                             seen_ids[val].append(cell_pos)
 
-                    # 4. 연락처 형식 검사
                     elif any(p in col_title for p in ["핸드폰", "연락처", "전화번호"]):
                         if not PHONE_PATTERN.match(val):
                             errors_summary.append(f"{cell_pos}: 연락처 번호 형식 오류")
 
-                    # 5. 성별 형식 검사
                     elif col_title == "성별":
                         if val not in ["남", "여"]:
                             errors_summary.append(f"{cell_pos}: 성별 표기 오류 ('남' 또는 '여'만 가능)")
 
-                    # 6. 나이 형식 검사
                     elif any(a in col_title for a in ["나이", "만나이"]):
                         clean_age = val.replace("세", "").strip()
                         if not clean_age.isdigit() or not (1 <= int(clean_age) <= 130):
                             errors_summary.append(f"{cell_pos}: 나이 숫자 표기 오류")
 
-            # 고유번호 중복 종합
             for uid, pos_list in seen_ids.items():
                 if len(pos_list) > 1:
                     errors_summary.append(f"고유번호 중복 발견 -> 위치: {', '.join(pos_list)}")
