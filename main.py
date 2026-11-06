@@ -202,7 +202,8 @@ async def validate_file(req: ValidateRequest):
                         if not val:
                             errors_summary.append(f"{cell_pos}: 고유번호 누락")
                         elif not ID_PATTERN.match(val):
-                            errors_summary.append(f"{cell_pos}: 고유번호 형식 오류 (8자리-5자리 아님)")
+                            # 요청 반영: '(8자리-5자리 아님)' 문구 제거
+                            errors_summary.append(f"{cell_pos}: 고유번호 형식 오류")
                         else:
                             if val not in seen_ids: seen_ids[val] = []
                             seen_ids[val].append(cell_pos)
@@ -218,9 +219,11 @@ async def validate_file(req: ValidateRequest):
                             if not clean_age.isdigit() or not (1 <= int(clean_age) <= 130):
                                 errors_summary.append(f"{cell_pos}: 나이 숫자 표기 오류")
 
+            # 요청 반영: 개수 상관없이 무조건 줄바꿈 정렬 적용
             for uid, pos_list in seen_ids.items():
                 if len(pos_list) > 1:
-                    errors_summary.append(f"고유번호 중복 발견 -> 위치: {', '.join(pos_list)}")
+                    formatted_pos = "\n  ↳ " + "\n  ↳ ".join(pos_list)
+                    errors_summary.append(f"고유번호 중복 발견 (총 {len(pos_list)}곳):{formatted_pos}")
 
         is_invalid = len(errors_summary) > 0
         return {
